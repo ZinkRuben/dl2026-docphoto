@@ -72,7 +72,7 @@ def run_url() -> str | None:
     """The page of the current run, or None offline."""
     if wandb.run is None:
         return None
-    return wandb.run.get_url() if wandb.run.settings.mode == "online" else f"(offline: {wandb.run.dir})"
+    return wandb.run.url if wandb.run.settings.mode == "online" else f"(offline: {wandb.run.dir})"
 
 
 def finish() -> None:
