@@ -42,10 +42,17 @@ information across the test set. See section 2 of the project description.
 from __future__ import annotations
 
 import argparse
+import io
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import torch
 import yaml
+from PIL import Image
+
+from src.data.dataset import pixels_of_image
+from src.models.mlp import MLP
 
 
 def load_model(checkpoint: Path, cfg: dict):
@@ -54,7 +61,17 @@ def load_model(checkpoint: Path, cfg: dict):
     Put the model in eval mode and disable gradients. Return something callable
     that maps one preprocessed image to one float.
     """
-    raise NotImplementedError("TODO: build the model and load the checkpoint")
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    train_cfg = ckpt["config"]          # the architecture comes from the checkpoint, not from the CLI config
+    model = MLP(in_dim=ckpt["in_dim"], hidden=list(train_cfg["model"]["hidden"]),
+                dropout=train_cfg["model"]["dropout"])
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model.pixel_size = train_cfg["data"]["pixel_size"]
+    model.scaler_mean, model.scaler_scale = ckpt["scaler_mean"], ckpt["scaler_scale"]
+    return model
 
 
 def preprocess(image_path: Path, cfg: dict):
@@ -64,12 +81,25 @@ def preprocess(image_path: Path, cfg: dict):
     between training and prediction is the single most common reason a good
     validation score turns into a bad leaderboard score.
     """
-    raise NotImplementedError("TODO: load and preprocess a single image")
+    # Training read the 768 px cache (data/work/train_768), not the originals. Rebuild it the way
+    # build_cache does, JPEG re-encoding included, or the 64 px pixels differ and so do the predictions.
+    im = Image.open(image_path)
+    im.draft("RGB", (768, 768))
+    im = im.convert("RGB")
+    im.thumbnail((768, 768), Image.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+    return pixels_of_image(buf, cfg["data"]["pixel_size"])[None, :]   # standardising needs the model: see predict_one
 
 
 def predict_one(model, image_path: Path, cfg: dict) -> float:
     """One image in, one number out."""
-    raise NotImplementedError("TODO: run the model, return a float in [0, 1]")
+    x = preprocess(image_path, {"data": {"pixel_size": model.pixel_size}})   # the size training used
+    x = (x - model.scaler_mean) / model.scaler_scale                   # same standardiser, fitted on training rows
+    with torch.no_grad():
+        out = model(torch.as_tensor(x, dtype=torch.float32))
+    return float(np.clip(out.item(), 0.0, 1.0))
 
 
 def main() -> None:

@@ -160,6 +160,49 @@ def train_mlp(cfg: dict, X: np.ndarray, df: pd.DataFrame, train_idx: np.ndarray,
             "model": model, "checkpoint": ckpt, "url": url, "val_index": val_idx, "ok": ok}
 
 
+def train_mlp_early_stop(cfg: dict, X: np.ndarray, df: pd.DataFrame, train_idx: np.ndarray, val_idx: np.ndarray,
+                         device: str | None = None, log=print) -> dict:
+    """Early stopping without peeking: the best epoch is chosen on training groups, never on the validation set.
+
+    One whole `group_column` unit is set aside from the training rows (same procedure as the main split).
+    The network trains on the rest, the epoch with the lowest RMSE on the set-aside unit is kept, and the
+    untouched validation set is scored once, with those weights.
+    """
+    import copy
+
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(cfg["seed"])
+    tr, sp = cfg["train"], cfg["split"]
+    inner_tr, inner_sel = build_splits(df.iloc[train_idx], sp["group_column"], sp["val_fraction"], sp["seed"])
+    fit_idx, sel_idx = train_idx[inner_tr], train_idx[inner_sel]
+
+    target = df[config.TARGET].to_numpy()
+    ok_all = df["eval_ok"].to_numpy() == 1
+    scaler = Standardiser().fit(X[fit_idx])
+    X_fit, X_sel, X_val = (to_tensor(scaler.transform(X[i]), device) for i in (fit_idx, sel_idx, val_idx))
+    y_fit = to_tensor(target[fit_idx], device)
+
+    model = MLP(in_dim=X.shape[1], hidden=list(cfg["model"]["hidden"]), dropout=cfg["model"]["dropout"],
+                prior=float(y_fit.mean())).to(device)
+    optimizer = make_optimizer(model, cfg)
+    loss_fn = torch.nn.MSELoss()
+    generator = torch.Generator().manual_seed(cfg["seed"])
+
+    best, best_state, history = (float("inf"), 0), None, []
+    for epoch in range(1, tr["epochs"] + 1):
+        loss = train_epoch(model, optimizer, loss_fn, X_fit, y_fit, tr["batch_size"], generator)
+        sel = validate(model, X_sel, target[sel_idx], ok_all[sel_idx])
+        history.append({"epoch": epoch, "train_loss": loss, "select_rmse": sel})
+        if sel < best[0]:
+            best, best_state = (sel, epoch), copy.deepcopy(model.state_dict())
+    model.load_state_dict(best_state)
+    val = validate(model, X_val, target[val_idx], ok_all[val_idx])      # the only time validation is touched
+    log(f"{cfg['name']}: trained on {len(fit_idx)} rows, selected on {len(sel_idx)} rows "
+        f"(units {sorted(df['group_strict'].iloc[sel_idx].unique())}); best epoch {best[1]} "
+        f"(select RMSE {best[0]:.4f}); untouched val RMSE {val:.4f}")
+    return {"val_rmse": val, "best_epoch": best[1], "select_rmse": best[0], "history": pd.DataFrame(history), "model": model}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train the MLP from a config")
     ap.add_argument("--config", required=True)
